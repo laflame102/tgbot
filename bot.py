@@ -22,7 +22,10 @@ SUPPORTED_DOMAINS = (
     "x.com",
     "instagram.com",
     "instagr.am",
+    "music.youtube.com",
 )
+
+YOUTUBE_MUSIC_DOMAINS = ("music.youtube.com",)
 
 URL_RE = re.compile(r"https?://[^\s]+")
 
@@ -36,6 +39,32 @@ log = logging.getLogger(__name__)
 
 def is_supported(url: str) -> bool:
     return any(domain in url for domain in SUPPORTED_DOMAINS)
+
+
+def is_youtube_music(url: str) -> bool:
+    return any(domain in url for domain in YOUTUBE_MUSIC_DOMAINS)
+
+
+def download_audio(url: str, out_dir: str) -> str | None:
+    # Без ffmpeg: завантажуємо m4a або webm напряму (Telegram їх програє)
+    ydl_opts = {
+        "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        if os.path.exists(filename):
+            return filename
+        # Fallback: шукаємо будь-який аудіо файл у папці
+        for ext in ("m4a", "webm", "opus", "ogg"):
+            candidate = str(Path(filename).with_suffix(f".{ext}"))
+            if os.path.exists(candidate):
+                return candidate
+        return None
 
 
 def download_video(url: str, out_dir: str) -> str | None:
@@ -60,8 +89,8 @@ def download_video(url: str, out_dir: str) -> str | None:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Кидай посилання на TikTok, Twitter/X або Instagram — "
-        "я завантажу відео і скину сюди."
+        "Привіт! Кидай посилання на TikTok, Twitter/X або Instagram — я завантажу відео.\n"
+        "Для YouTube Music (music.youtube.com) — скину MP3 пісню."
     )
 
 
@@ -77,26 +106,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for url in urls:
+        audio_mode = is_youtube_music(url)
         status = await msg.reply_text("⏳ Завантажую...")
 
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                filepath = download_video(url, tmp)
+                if audio_mode:
+                    filepath = download_audio(url, tmp)
+                else:
+                    filepath = download_video(url, tmp)
 
                 if filepath is None:
-                    await status.edit_text("❌ Не вдалося завантажити відео.")
+                    await status.edit_text("❌ Не вдалося завантажити файл.")
                     continue
 
                 size_mb = os.path.getsize(filepath) / 1024 / 1024
                 if size_mb > MAX_SIZE_MB:
                     await status.edit_text(
-                        f"❌ Відео {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
+                        f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
                     )
                     continue
 
                 await status.edit_text("📤 Відправляю...")
                 with open(filepath, "rb") as f:
-                    await msg.reply_video(f)
+                    if audio_mode:
+                        await msg.reply_audio(f)
+                    else:
+                        await msg.reply_video(f)
                 await status.delete()
 
         except yt_dlp.utils.DownloadError as e:
