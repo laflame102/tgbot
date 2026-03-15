@@ -67,6 +67,8 @@ def download_audio(url: str, out_dir: str) -> str | None:
         "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
         "quiet": True,
         "no_warnings": True,
+        # Android клієнт обходить перевірку "Sign in to confirm you're not a bot"
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
     if _COOKIES_FILE:
         ydl_opts["cookiefile"] = _COOKIES_FILE
