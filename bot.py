@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import re
@@ -14,6 +15,20 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MAX_SIZE_MB = 49
+
+# Cookies для YouTube (base64-encoded cookies.txt, задається як env змінна)
+_COOKIES_FILE: str | None = None
+
+def _init_cookies() -> None:
+    global _COOKIES_FILE
+    encoded = os.getenv("YOUTUBE_COOKIES", "")
+    if not encoded:
+        return
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+    tmp.write(base64.b64decode(encoded))
+    tmp.close()
+    _COOKIES_FILE = tmp.name
+    log.info("YouTube cookies завантажено з env")
 
 SUPPORTED_DOMAINS = (
     "tiktok.com",
@@ -53,6 +68,8 @@ def download_audio(url: str, out_dir: str) -> str | None:
         "quiet": True,
         "no_warnings": True,
     }
+    if _COOKIES_FILE:
+        ydl_opts["cookiefile"] = _COOKIES_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -149,6 +166,7 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задано!")
 
+    _init_cookies()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
