@@ -219,6 +219,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return  # тимчасово вимкнено
     msg = update.message
     if not msg:
         return
