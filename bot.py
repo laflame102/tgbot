@@ -1,10 +1,17 @@
 import base64
+import io
 import logging
 import os
 import re
 import tempfile
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 import httpx
 import yt_dlp
@@ -27,8 +34,9 @@ LOCAL_BOT_API = os.getenv("LOCAL_BOT_API_SERVER", "")
 MAX_SIZE_MB = 2000 if LOCAL_BOT_API else 49
 RATES_CHAT_ID = os.getenv("RATES_CHAT_ID", "")
 
-PRIVAT_API = "https://api.privatbank.ua/p24api/pubinfo?json&exchange&coursid=5"
+PRIVAT_HISTORY_API = "https://api.privatbank.ua/p24api/exchange_rates?json&date={date}"
 CURRENCY_LABELS = {"USD": "Долар", "EUR": "Євро", "GBP": "Фунт стерлінгів"}
+CURRENCY_COLORS = {"USD": "#2ecc71", "EUR": "#5b9bd5", "GBP": "#e74c3c"}
 
 # Cookies для YouTube (base64-encoded cookies.txt, задається як env змінна)
 _COOKIES_FILE: str | None = None
@@ -80,40 +88,102 @@ log = logging.getLogger(__name__)
 # ── PrivatBank rates ──────────────────────────────────────────────────────────
 
 
-async def fetch_privat_rates() -> str:
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(PRIVAT_API)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as e:
-        log.warning("Не вдалося отримати курси: %s", e)
-        return "❌ Не вдалося отримати курси валют."
+async def fetch_rates_history(days: int = 7) -> dict:
+    """Повертає {ccy: [(date, buy, sale), ...]} за останні days днів."""
+    history = {ccy: [] for ccy in CURRENCY_LABELS}
+    async with httpx.AsyncClient(timeout=15) as client:
+        for i in range(days - 1, -1, -1):
+            day = datetime.now() - timedelta(days=i)
+            date_str = day.strftime("%d.%m.%Y")
+            try:
+                resp = await client.get(PRIVAT_HISTORY_API.format(date=date_str))
+                resp.raise_for_status()
+                data = resp.json()
+                for rate in data.get("exchangeRate", []):
+                    ccy = rate.get("currency")
+                    if ccy not in CURRENCY_LABELS:
+                        continue
+                    buy = rate.get("purchaseRate") or rate.get("purchaseRateNB")
+                    sale = rate.get("saleRate") or rate.get("saleRateNB")
+                    if buy and sale:
+                        history[ccy].append((day.date(), float(buy), float(sale)))
+            except Exception as e:
+                log.warning("Помилка курсів за %s: %s", date_str, e)
+    return history
 
+
+def build_rates_chart(history: dict) -> io.BytesIO:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor("#1a1a2e")
+    ax.set_facecolor("#16213e")
+
+    for ccy, points in history.items():
+        if not points:
+            continue
+        dates = [p[0] for p in points]
+        sales = [p[2] for p in points]
+        color = CURRENCY_COLORS[ccy]
+        ax.plot(dates, sales, marker="o", label=ccy, color=color, linewidth=2, markersize=5)
+        # підписи значень на крайніх точках
+        ax.annotate(f"{sales[0]:.2f}", (dates[0], sales[0]), textcoords="offset points",
+                    xytext=(-5, 6), color=color, fontsize=8)
+        ax.annotate(f"{sales[-1]:.2f}", (dates[-1], sales[-1]), textcoords="offset points",
+                    xytext=(5, 6), color=color, fontsize=8)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#444")
+    ax.grid(True, alpha=0.15, color="white")
+    ax.legend(facecolor="#1a1a2e", labelcolor="white", edgecolor="#444", fontsize=11)
+    ax.set_title("ПриватБанк — курс продажу за 7 днів (UAH)", color="white", fontsize=13, pad=12)
+    ax.set_ylabel("UAH", color="white")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+def build_rates_text(history: dict) -> str:
     lines = ["💱 *Курс ПриватБанку (готівка):*\n"]
-    for item in data:
-        ccy = item.get("ccy", "")
-        if ccy in CURRENCY_LABELS:
-            buy = item.get("buy", "—")
-            sale = item.get("sale", "—")
-            lines.append(f"*{ccy}* — {CURRENCY_LABELS[ccy]}\n  купівля: `{buy}` / продаж: `{sale}`")
-
+    for ccy, label in CURRENCY_LABELS.items():
+        points = history.get(ccy, [])
+        if not points:
+            continue
+        buy_today, sale_today = points[-1][1], points[-1][2]
+        sale_week = points[0][2]
+        diff = sale_today - sale_week
+        arrow = "📈" if diff > 0.005 else ("📉" if diff < -0.005 else "➡️")
+        diff_str = f"+{diff:.2f}" if diff >= 0 else f"{diff:.2f}"
+        lines.append(
+            f"*{ccy}* — {label}\n"
+            f"  купівля: `{buy_today:.2f}` / продаж: `{sale_today:.2f}`\n"
+            f"  {arrow} за тиждень: `{diff_str} грн`"
+        )
     if len(lines) == 1:
-        return "❌ Не знайдено потрібних валют у відповіді API."
-    return "\n".join(lines)
+        return "❌ Не вдалося отримати дані."
+    return "\n\n".join(lines)
 
 
 async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text("⏳ Отримую курси...")
-    text = await fetch_privat_rates()
-    await status.edit_text(text, parse_mode="Markdown")
+    status = await update.message.reply_text("⏳ Збираю дані за тиждень...")
+    history = await fetch_rates_history(7)
+    text = build_rates_text(history)
+    chart = build_rates_chart(history)
+    await status.delete()
+    await update.message.reply_photo(photo=chart, caption=text, parse_mode="Markdown")
 
 
 async def send_rates_job(context: ContextTypes.DEFAULT_TYPE):
     if not RATES_CHAT_ID:
         return
-    text = await fetch_privat_rates()
-    await context.bot.send_message(chat_id=RATES_CHAT_ID, text=text, parse_mode="Markdown")
+    history = await fetch_rates_history(7)
+    text = build_rates_text(history)
+    chart = build_rates_chart(history)
+    await context.bot.send_photo(chat_id=RATES_CHAT_ID, photo=chart, caption=text, parse_mode="Markdown")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
