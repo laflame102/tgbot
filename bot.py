@@ -3,21 +3,31 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MAX_SIZE_MB = 49
+LOCAL_BOT_API = os.getenv("LOCAL_BOT_API_SERVER", "")
+MAX_SIZE_MB = 2000 if LOCAL_BOT_API else 49
 
 # Cookies для YouTube (base64-encoded cookies.txt, задається як env змінна)
 _COOKIES_FILE: str | None = None
+
 
 def _init_cookies() -> None:
     global _COOKIES_FILE
@@ -30,6 +40,7 @@ def _init_cookies() -> None:
     _COOKIES_FILE = tmp.name
     log.info("YouTube cookies завантажено з env")
 
+
 SUPPORTED_DOMAINS = (
     "tiktok.com",
     "vm.tiktok.com",
@@ -37,10 +48,21 @@ SUPPORTED_DOMAINS = (
     "x.com",
     "instagram.com",
     "instagr.am",
+    "youtube.com",
+    "youtu.be",
     "music.youtube.com",
 )
 
 YOUTUBE_MUSIC_DOMAINS = ("music.youtube.com",)
+YOUTUBE_VIDEO_DOMAINS = ("youtube.com", "youtu.be")
+
+QUALITY_FORMATS = {
+    "360":  "best[height<=360][ext=mp4]/best[height<=360]",
+    "480":  "best[height<=480][ext=mp4]/best[height<=480]",
+    "720":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+    "1080": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]",
+    "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+}
 
 URL_RE = re.compile(r"https?://[^\s]+")
 
@@ -52,6 +74,7 @@ log = logging.getLogger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def is_supported(url: str) -> bool:
     return any(domain in url for domain in SUPPORTED_DOMAINS)
 
@@ -60,14 +83,16 @@ def is_youtube_music(url: str) -> bool:
     return any(domain in url for domain in YOUTUBE_MUSIC_DOMAINS)
 
 
+def is_youtube_video(url: str) -> bool:
+    return any(domain in url for domain in YOUTUBE_VIDEO_DOMAINS) and not is_youtube_music(url)
+
+
 def download_audio(url: str, out_dir: str) -> str | None:
-    # Без ffmpeg: завантажуємо m4a або webm напряму (Telegram їх програє)
     ydl_opts = {
         "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
         "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
         "quiet": True,
         "no_warnings": True,
-        # Android клієнт обходить перевірку "Sign in to confirm you're not a bot"
         "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
     if _COOKIES_FILE:
@@ -78,7 +103,6 @@ def download_audio(url: str, out_dir: str) -> str | None:
         filename = ydl.prepare_filename(info)
         if os.path.exists(filename):
             return filename
-        # Fallback: шукаємо будь-який аудіо файл у папці
         for ext in ("m4a", "webm", "opus", "ogg"):
             candidate = str(Path(filename).with_suffix(f".{ext}"))
             if os.path.exists(candidate):
@@ -86,30 +110,67 @@ def download_audio(url: str, out_dir: str) -> str | None:
         return None
 
 
-def download_video(url: str, out_dir: str) -> str | None:
+def download_video(url: str, out_dir: str, quality: str = "best") -> str | None:
+    fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
+
     ydl_opts = {
         "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
+        "format": fmt,
         "quiet": True,
         "no_warnings": True,
-        # cookies потрібні для Instagram — підклади cookies.txt поруч з bot.py
-        # "cookiefile": "cookies.txt",
+        "merge_output_format": "mp4",
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
+    if _COOKIES_FILE:
+        ydl_opts["cookiefile"] = _COOKIES_FILE
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        if not os.path.exists(filename):
-            filename = str(Path(filename).with_suffix(".mp4"))
-        return filename if os.path.exists(filename) else None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            # yt-dlp може змінити розширення після merge
+            for ext in ("mp4", "mkv", "webm", "avi"):
+                candidate = str(Path(filename).with_suffix(f".{ext}"))
+                if os.path.exists(candidate):
+                    return candidate
+            if os.path.exists(filename):
+                return filename
+            return None
+    except yt_dlp.utils.DownloadError:
+        # Fallback: якщо якість недоступна — беремо найкращий мuxed потік
+        if quality != "best":
+            log.warning("Якість %s недоступна, завантажую найкращий доступний варіант", quality)
+            ydl_opts["format"] = "best[ext=mp4]/best"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                for ext in ("mp4", "mkv", "webm"):
+                    candidate = str(Path(filename).with_suffix(f".{ext}"))
+                    if os.path.exists(candidate):
+                        return candidate
+                return filename if os.path.exists(filename) else None
+        raise
+
+
+async def _send_file(msg, filepath: str, audio_mode: bool):
+    with open(filepath, "rb") as f:
+        if audio_mode:
+            await msg.reply_audio(f)
+        else:
+            await msg.reply_video(f, supports_streaming=True)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Кидай посилання на TikTok, Twitter/X або Instagram — я завантажу відео.\n"
-        "Для YouTube Music (music.youtube.com) — скину MP3 пісню."
+        "Привіт! Кидай посилання — я завантажу відео або аудіо.\n\n"
+        "Підтримується:\n"
+        "• TikTok, Twitter/X, Instagram — відео\n"
+        "• YouTube (youtube.com, youtu.be) — відео з вибором якості\n"
+        "• YouTube Music (music.youtube.com) — аудіо\n\n"
+        f"Ліміт файлу: {MAX_SIZE_MB} MB"
     )
 
 
@@ -125,41 +186,128 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for url in urls:
-        audio_mode = is_youtube_music(url)
-        status = await msg.reply_text("⏳ Завантажую...")
-
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                if audio_mode:
+        if is_youtube_music(url):
+            # Аудіо — завантажуємо одразу
+            status = await msg.reply_text("⏳ Завантажую аудіо...")
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
                     filepath = download_audio(url, tmp)
-                else:
+                    if filepath is None:
+                        await status.edit_text("❌ Не вдалося завантажити файл.")
+                        continue
+                    size_mb = os.path.getsize(filepath) / 1024 / 1024
+                    if size_mb > MAX_SIZE_MB:
+                        await status.edit_text(
+                            f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
+                        )
+                        continue
+                    await status.edit_text("📤 Відправляю...")
+                    await _send_file(msg, filepath, audio_mode=True)
+                    await status.delete()
+            except yt_dlp.utils.DownloadError as e:
+                log.warning("DownloadError for %s: %s", url, e)
+                await status.edit_text(f"❌ Помилка завантаження:\n{e}")
+            except Exception:
+                log.exception("Unexpected error for %s", url)
+                await status.edit_text("❌ Сталась несподівана помилка.")
+
+        elif is_youtube_video(url):
+            # YouTube відео — показуємо вибір якості
+            dl_id = str(uuid.uuid4())[:8]
+            context.bot_data[dl_id] = {
+                "url": url,
+                "chat_id": msg.chat_id,
+                "message_id": msg.message_id,
+            }
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("360p", callback_data=f"dl:{dl_id}:360"),
+                    InlineKeyboardButton("480p", callback_data=f"dl:{dl_id}:480"),
+                    InlineKeyboardButton("720p", callback_data=f"dl:{dl_id}:720"),
+                    InlineKeyboardButton("1080p", callback_data=f"dl:{dl_id}:1080"),
+                    InlineKeyboardButton("Найкраща", callback_data=f"dl:{dl_id}:best"),
+                ]
+            ]
+            await msg.reply_text(
+                "🎬 Обери якість відео:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+        else:
+            # Інші платформи — завантажуємо одразу
+            status = await msg.reply_text("⏳ Завантажую...")
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
                     filepath = download_video(url, tmp)
+                    if filepath is None:
+                        await status.edit_text("❌ Не вдалося завантажити файл.")
+                        continue
+                    size_mb = os.path.getsize(filepath) / 1024 / 1024
+                    if size_mb > MAX_SIZE_MB:
+                        await status.edit_text(
+                            f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
+                        )
+                        continue
+                    await status.edit_text("📤 Відправляю...")
+                    await _send_file(msg, filepath, audio_mode=False)
+                    await status.delete()
+            except yt_dlp.utils.DownloadError as e:
+                log.warning("DownloadError for %s: %s", url, e)
+                await status.edit_text(f"❌ Помилка завантаження:\n{e}")
+            except Exception:
+                log.exception("Unexpected error for %s", url)
+                await status.edit_text("❌ Сталась несподівана помилка.")
 
-                if filepath is None:
-                    await status.edit_text("❌ Не вдалося завантажити файл.")
-                    continue
 
-                size_mb = os.path.getsize(filepath) / 1024 / 1024
-                if size_mb > MAX_SIZE_MB:
-                    await status.edit_text(
-                        f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
-                    )
-                    continue
+async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-                await status.edit_text("📤 Відправляю...")
-                with open(filepath, "rb") as f:
-                    if audio_mode:
-                        await msg.reply_audio(f)
-                    else:
-                        await msg.reply_video(f)
-                await status.delete()
+    parts = query.data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "dl":
+        return
 
-        except yt_dlp.utils.DownloadError as e:
-            log.warning("DownloadError for %s: %s", url, e)
-            await status.edit_text(f"❌ Помилка завантаження:\n{e}")
-        except Exception:
-            log.exception("Unexpected error for %s", url)
-            await status.edit_text("❌ Сталась несподівана помилка.")
+    _, dl_id, quality = parts
+    data = context.bot_data.pop(dl_id, None)
+    if data is None:
+        await query.edit_message_text("❌ Сесія завантаження застаріла. Надішли посилання знову.")
+        return
+
+    url = data["url"]
+    quality_label = quality if quality != "best" else "найкраща"
+    await query.edit_message_text(f"⏳ Завантажую відео ({quality_label})...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = download_video(url, tmp, quality=quality)
+            if filepath is None:
+                await query.edit_message_text("❌ Не вдалося завантажити файл.")
+                return
+
+            size_mb = os.path.getsize(filepath) / 1024 / 1024
+            if size_mb > MAX_SIZE_MB:
+                await query.edit_message_text(
+                    f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
+                )
+                return
+
+            await query.edit_message_text("📤 Відправляю...")
+            chat_id = data["chat_id"]
+            with open(filepath, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    supports_streaming=True,
+                )
+            await query.delete_message()
+
+    except yt_dlp.utils.DownloadError as e:
+        log.warning("DownloadError for %s: %s", url, e)
+        await query.edit_message_text(f"❌ Помилка завантаження:\n{e}")
+    except Exception:
+        log.exception("Unexpected error for %s", url)
+        await query.edit_message_text("❌ Сталась несподівана помилка.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -169,9 +317,16 @@ if __name__ == "__main__":
         raise RuntimeError("BOT_TOKEN не задано!")
 
     _init_cookies()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    builder = ApplicationBuilder().token(BOT_TOKEN)
+    if LOCAL_BOT_API:
+        builder = builder.base_url(f"{LOCAL_BOT_API}/bot").local_mode(True)
+        log.info("Використовується локальний Bot API сервер: %s", LOCAL_BOT_API)
+
+    app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^dl:"))
 
-    log.info("Bot started")
+    log.info("Bot started (max file size: %d MB)", MAX_SIZE_MB)
     app.run_polling()
