@@ -6,6 +6,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import httpx
 import yt_dlp
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,6 +25,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOCAL_BOT_API = os.getenv("LOCAL_BOT_API_SERVER", "")
 MAX_SIZE_MB = 2000 if LOCAL_BOT_API else 49
+RATES_CHAT_ID = os.getenv("RATES_CHAT_ID", "")
+
+PRIVAT_API = "https://api.privatbank.ua/p24api/pubinfo?json&exchange&coursid=5"
+CURRENCY_LABELS = {"USD": "Долар", "EUR": "Євро", "GBP": "Фунт стерлінгів"}
 
 # Cookies для YouTube (base64-encoded cookies.txt, задається як env змінна)
 _COOKIES_FILE: str | None = None
@@ -71,6 +76,45 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# ── PrivatBank rates ──────────────────────────────────────────────────────────
+
+
+async def fetch_privat_rates() -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(PRIVAT_API)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        log.warning("Не вдалося отримати курси: %s", e)
+        return "❌ Не вдалося отримати курси валют."
+
+    lines = ["💱 *Курс ПриватБанку (готівка):*\n"]
+    for item in data:
+        ccy = item.get("ccy", "")
+        if ccy in CURRENCY_LABELS:
+            buy = item.get("buy", "—")
+            sale = item.get("sale", "—")
+            lines.append(f"*{ccy}* — {CURRENCY_LABELS[ccy]}\n  купівля: `{buy}` / продаж: `{sale}`")
+
+    if len(lines) == 1:
+        return "❌ Не знайдено потрібних валют у відповіді API."
+    return "\n".join(lines)
+
+
+async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("⏳ Отримую курси...")
+    text = await fetch_privat_rates()
+    await status.edit_text(text, parse_mode="Markdown")
+
+
+async def send_rates_job(context: ContextTypes.DEFAULT_TYPE):
+    if not RATES_CHAT_ID:
+        return
+    text = await fetch_privat_rates()
+    await context.bot.send_message(chat_id=RATES_CHAT_ID, text=text, parse_mode="Markdown")
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -325,8 +369,13 @@ if __name__ == "__main__":
 
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("rates", cmd_rates))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^dl:"))
+
+    if RATES_CHAT_ID:
+        app.job_queue.run_repeating(send_rates_job, interval=8 * 3600, first=10)
+        log.info("Авторозсилка курсів кожні 8 год у чат %s", RATES_CHAT_ID)
 
     log.info("Bot started (max file size: %d MB)", MAX_SIZE_MB)
     app.run_polling()
