@@ -311,6 +311,15 @@ def download_audio(url: str, out_dir: str) -> str | None:
         return None
 
 
+def _resolve_filename(ydl: yt_dlp.YoutubeDL, entry: dict) -> str | None:
+    filename = ydl.prepare_filename(entry)
+    for ext in ("mp4", "mkv", "webm", "avi"):
+        candidate = str(Path(filename).with_suffix(f".{ext}"))
+        if os.path.exists(candidate):
+            return candidate
+    return filename if os.path.exists(filename) else None
+
+
 def download_video(url: str, out_dir: str, quality: str = "best") -> str | None:
     fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
 
@@ -328,29 +337,41 @@ def download_video(url: str, out_dir: str, quality: str = "best") -> str | None:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            # yt-dlp може змінити розширення після merge
-            for ext in ("mp4", "mkv", "webm", "avi"):
-                candidate = str(Path(filename).with_suffix(f".{ext}"))
-                if os.path.exists(candidate):
-                    return candidate
-            if os.path.exists(filename):
-                return filename
-            return None
+            entry = info["entries"][0] if info.get("entries") else info
+            return _resolve_filename(ydl, entry)
     except yt_dlp.utils.DownloadError:
-        # Fallback: якщо якість недоступна — беремо найкращий мuxed потік
         if quality != "best":
             log.warning("Якість %s недоступна, завантажую найкращий доступний варіант", quality)
             ydl_opts["format"] = "best[ext=mp4]/best"
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                for ext in ("mp4", "mkv", "webm"):
-                    candidate = str(Path(filename).with_suffix(f".{ext}"))
-                    if os.path.exists(candidate):
-                        return candidate
-                return filename if os.path.exists(filename) else None
+                entry = info["entries"][0] if info.get("entries") else info
+                return _resolve_filename(ydl, entry)
         raise
+
+
+def download_all_videos(url: str, out_dir: str) -> list[str]:
+    ydl_opts = {
+        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+    }
+    if _COOKIES_FILE:
+        ydl_opts["cookiefile"] = _COOKIES_FILE
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+        results = []
+        for entry in (entries or []):
+            if entry is None:
+                continue
+            path = _resolve_filename(ydl, entry)
+            if path:
+                results.append(path)
+        return results
 
 
 async def _send_file(msg, filepath: str, audio_mode: bool):
@@ -436,22 +457,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         else:
-            # Інші платформи — завантажуємо одразу
+            # Інші платформи (TikTok, Twitter) — завантажуємо всі відео з поста
             status = await msg.reply_text("⏳ Завантажую...")
             try:
                 with tempfile.TemporaryDirectory() as tmp:
-                    filepath = download_video(url, tmp)
-                    if filepath is None:
+                    filepaths = await asyncio.get_event_loop().run_in_executor(
+                        None, download_all_videos, url, tmp
+                    )
+                    if not filepaths:
                         await status.edit_text("❌ Не вдалося завантажити файл.")
                         continue
-                    size_mb = os.path.getsize(filepath) / 1024 / 1024
-                    if size_mb > MAX_SIZE_MB:
-                        await status.edit_text(
-                            f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
-                        )
-                        continue
                     await status.edit_text("📤 Відправляю...")
-                    await _send_file(msg, filepath, audio_mode=False)
+                    for filepath in filepaths:
+                        size_mb = os.path.getsize(filepath) / 1024 / 1024
+                        if size_mb > MAX_SIZE_MB:
+                            await msg.reply_text(
+                                f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
+                            )
+                            continue
+                        await _send_file(msg, filepath, audio_mode=False)
                     await status.delete()
             except yt_dlp.utils.DownloadError as e:
                 log.warning("DownloadError for %s: %s", url, e)
