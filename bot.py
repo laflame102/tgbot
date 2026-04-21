@@ -1,23 +1,16 @@
 import asyncio
 import base64
-import io
 import logging
 import os
 import re
 import tempfile
 import uuid
-from datetime import datetime, timedelta
 from pathlib import Path
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 import httpx
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -35,9 +28,9 @@ LOCAL_BOT_API = os.getenv("LOCAL_BOT_API_SERVER", "")
 MAX_SIZE_MB = 2000 if LOCAL_BOT_API else 49
 RATES_CHAT_ID = os.getenv("RATES_CHAT_ID", "")
 
-PRIVAT_HISTORY_API = "https://api.privatbank.ua/p24api/exchange_rates?json&date={date}"
-CURRENCY_LABELS = {"USD": "Долар", "EUR": "Євро", "GBP": "Фунт стерлінгів"}
-CURRENCY_COLORS = {"USD": "#2ecc71", "EUR": "#5b9bd5", "GBP": "#e74c3c"}
+# PRIVAT_HISTORY_API = "https://api.privatbank.ua/p24api/exchange_rates?json&date={date}"
+# CURRENCY_LABELS = {"USD": "Долар", "EUR": "Євро", "GBP": "Фунт стерлінгів"}
+# CURRENCY_COLORS = {"USD": "#2ecc71", "EUR": "#5b9bd5", "GBP": "#e74c3c"}
 
 # Cookies для YouTube (base64-encoded cookies.txt, задається як env змінна)
 _COOKIES_FILE: str | None = None
@@ -58,13 +51,6 @@ def _init_cookies() -> None:
 SUPPORTED_DOMAINS = (
     "tiktok.com",
     "vm.tiktok.com",
-    "twitter.com",
-    "x.com",
-    "instagram.com",
-    "instagr.am",
-    "youtube.com",
-    "youtu.be",
-    "music.youtube.com",
 )
 
 YOUTUBE_MUSIC_DOMAINS = ("music.youtube.com",)
@@ -86,203 +72,203 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── PrivatBank rates ──────────────────────────────────────────────────────────
+# ── PrivatBank rates (вимкнено) ───────────────────────────────────────────────
 
-PERIOD_LABELS = {7: "7 днів", 30: "Місяць", 90: "3 місяці", 365: "Рік"}
-_FETCH_SEM = asyncio.Semaphore(15)
-
-
-def rates_keyboard(active_days: int) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            f"✓ {label}" if days == active_days else label,
-            callback_data=f"rates_period:{days}",
-        )
-        for days, label in PERIOD_LABELS.items()
-    ]
-    return InlineKeyboardMarkup([buttons])
-
-
-async def fetch_rates_history(days: int) -> dict:
-    history = {ccy: [] for ccy in CURRENCY_LABELS}
-
-    async def fetch_day(client: httpx.AsyncClient, i: int):
-        day = datetime.now() - timedelta(days=i)
-        date_str = day.strftime("%d.%m.%Y")
-        async with _FETCH_SEM:
-            try:
-                resp = await client.get(PRIVAT_HISTORY_API.format(date=date_str))
-                resp.raise_for_status()
-                return day.date(), resp.json()
-            except Exception as e:
-                log.warning("Помилка курсів за %s: %s", date_str, e)
-                return day.date(), None
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        results = await asyncio.gather(*[fetch_day(client, i) for i in range(days - 1, -1, -1)])
-
-    for date, data in sorted(results, key=lambda x: x[0]):
-        if not data:
-            continue
-        for rate in data.get("exchangeRate", []):
-            ccy = rate.get("currency")
-            if ccy not in CURRENCY_LABELS:
-                continue
-            buy = rate.get("purchaseRate") or rate.get("purchaseRateNB")
-            sale = rate.get("saleRate") or rate.get("saleRateNB")
-            if buy and sale:
-                history[ccy].append((date, float(buy), float(sale)))
-
-    return history
-
-
-def build_rates_chart(history: dict, days: int) -> io.BytesIO:
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#16213e")
-
-    marker = "o" if days <= 30 else None
-    ms = 4 if days <= 30 else None
-
-    for ccy, points in history.items():
-        if not points:
-            continue
-        dates = [p[0] for p in points]
-        sales = [p[2] for p in points]
-        color = CURRENCY_COLORS[ccy]
-        ax.plot(dates, sales, marker=marker, markersize=ms, label=ccy, color=color, linewidth=2)
-        ax.annotate(f"{sales[0]:.2f}", (dates[0], sales[0]), textcoords="offset points",
-                    xytext=(-5, 6), color=color, fontsize=8)
-        ax.annotate(f"{sales[-1]:.2f}", (dates[-1], sales[-1]), textcoords="offset points",
-                    xytext=(5, 6), color=color, fontsize=8)
-
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(ax.xaxis.get_major_locator()))
-    ax.tick_params(colors="white", axis="both")
-    ax.tick_params(axis="x", rotation=20)
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#444")
-    ax.grid(True, alpha=0.15, color="white")
-    ax.legend(facecolor="#1a1a2e", labelcolor="white", edgecolor="#444", fontsize=11)
-    ax.set_title(f"ПриватБанк — курс продажу за {PERIOD_LABELS[days].lower()} (UAH)",
-                 color="white", fontsize=13, pad=12)
-    ax.set_ylabel("UAH", color="white")
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-
-def build_rates_text(history: dict, days: int) -> str:
-    period_label = PERIOD_LABELS[days].lower()
-    lines = ["💱 *Курс ПриватБанку (готівка):*\n"]
-    for ccy, label in CURRENCY_LABELS.items():
-        points = history.get(ccy, [])
-        if not points:
-            continue
-        buy_today, sale_today = points[-1][1], points[-1][2]
-        diff = sale_today - points[0][2]
-        arrow = "📈" if diff > 0.005 else ("📉" if diff < -0.005 else "➡️")
-        diff_str = f"+{diff:.2f}" if diff >= 0 else f"{diff:.2f}"
-        lines.append(
-            f"*{ccy}* — {label}\n"
-            f"  купівля: `{buy_today:.2f}` / продаж: `{sale_today:.2f}`\n"
-            f"  {arrow} за {period_label}: `{diff_str} грн`"
-        )
-    if len(lines) == 1:
-        return "❌ Не вдалося отримати дані."
-    return "\n\n".join(lines)
-
-
-async def _send_rates(days: int) -> tuple[io.BytesIO, str]:
-    history = await fetch_rates_history(days)
-    return build_rates_chart(history, days), build_rates_text(history, days)
-
-
-async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text("⏳ Збираю дані...")
-    chart, text = await _send_rates(7)
-    await status.delete()
-    await update.message.reply_photo(
-        photo=chart, caption=text, parse_mode="Markdown", reply_markup=rates_keyboard(7)
-    )
-
-
-async def handle_rates_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    days = int(query.data.split(":")[1])
-    await query.edit_message_caption(caption="⏳ Оновлюю...", parse_mode="Markdown")
-    chart, text = await _send_rates(days)
-    await query.edit_message_media(
-        media=InputMediaPhoto(media=chart, caption=text, parse_mode="Markdown"),
-        reply_markup=rates_keyboard(days),
-    )
-
-
-async def send_rates_job(context: ContextTypes.DEFAULT_TYPE):
-    if not RATES_CHAT_ID:
-        return
-    chart, text = await _send_rates(7)
-    await context.bot.send_photo(
-        chat_id=RATES_CHAT_ID, photo=chart, caption=text,
-        parse_mode="Markdown", reply_markup=rates_keyboard(7)
-    )
-
-
-# ── Binance P2P ───────────────────────────────────────────────────────────────
-
-BINANCE_P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-BINANCE_HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
-}
+# PERIOD_LABELS = {7: "7 днів", 30: "Місяць", 90: "3 місяці", 365: "Рік"}
+# _FETCH_SEM = asyncio.Semaphore(15)
+#
+#
+# def rates_keyboard(active_days: int) -> InlineKeyboardMarkup:
+#     buttons = [
+#         InlineKeyboardButton(
+#             f"✓ {label}" if days == active_days else label,
+#             callback_data=f"rates_period:{days}",
+#         )
+#         for days, label in PERIOD_LABELS.items()
+#     ]
+#     return InlineKeyboardMarkup([buttons])
+#
+#
+# async def fetch_rates_history(days: int) -> dict:
+#     history = {ccy: [] for ccy in CURRENCY_LABELS}
+#
+#     async def fetch_day(client: httpx.AsyncClient, i: int):
+#         day = datetime.now() - timedelta(days=i)
+#         date_str = day.strftime("%d.%m.%Y")
+#         async with _FETCH_SEM:
+#             try:
+#                 resp = await client.get(PRIVAT_HISTORY_API.format(date=date_str))
+#                 resp.raise_for_status()
+#                 return day.date(), resp.json()
+#             except Exception as e:
+#                 log.warning("Помилка курсів за %s: %s", date_str, e)
+#                 return day.date(), None
+#
+#     async with httpx.AsyncClient(timeout=20) as client:
+#         results = await asyncio.gather(*[fetch_day(client, i) for i in range(days - 1, -1, -1)])
+#
+#     for date, data in sorted(results, key=lambda x: x[0]):
+#         if not data:
+#             continue
+#         for rate in data.get("exchangeRate", []):
+#             ccy = rate.get("currency")
+#             if ccy not in CURRENCY_LABELS:
+#                 continue
+#             buy = rate.get("purchaseRate") or rate.get("purchaseRateNB")
+#             sale = rate.get("saleRate") or rate.get("saleRateNB")
+#             if buy and sale:
+#                 history[ccy].append((date, float(buy), float(sale)))
+#
+#     return history
+#
+#
+# def build_rates_chart(history: dict, days: int) -> io.BytesIO:
+#     fig, ax = plt.subplots(figsize=(10, 5))
+#     fig.patch.set_facecolor("#1a1a2e")
+#     ax.set_facecolor("#16213e")
+#
+#     marker = "o" if days <= 30 else None
+#     ms = 4 if days <= 30 else None
+#
+#     for ccy, points in history.items():
+#         if not points:
+#             continue
+#         dates = [p[0] for p in points]
+#         sales = [p[2] for p in points]
+#         color = CURRENCY_COLORS[ccy]
+#         ax.plot(dates, sales, marker=marker, markersize=ms, label=ccy, color=color, linewidth=2)
+#         ax.annotate(f"{sales[0]:.2f}", (dates[0], sales[0]), textcoords="offset points",
+#                     xytext=(-5, 6), color=color, fontsize=8)
+#         ax.annotate(f"{sales[-1]:.2f}", (dates[-1], sales[-1]), textcoords="offset points",
+#                     xytext=(5, 6), color=color, fontsize=8)
+#
+#     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+#     ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(ax.xaxis.get_major_locator()))
+#     ax.tick_params(colors="white", axis="both")
+#     ax.tick_params(axis="x", rotation=20)
+#     for spine in ax.spines.values():
+#         spine.set_edgecolor("#444")
+#     ax.grid(True, alpha=0.15, color="white")
+#     ax.legend(facecolor="#1a1a2e", labelcolor="white", edgecolor="#444", fontsize=11)
+#     ax.set_title(f"ПриватБанк — курс продажу за {PERIOD_LABELS[days].lower()} (UAH)",
+#                  color="white", fontsize=13, pad=12)
+#     ax.set_ylabel("UAH", color="white")
+#     plt.tight_layout()
+#
+#     buf = io.BytesIO()
+#     plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+#     buf.seek(0)
+#     plt.close(fig)
+#     return buf
+#
+#
+# def build_rates_text(history: dict, days: int) -> str:
+#     period_label = PERIOD_LABELS[days].lower()
+#     lines = ["💱 *Курс ПриватБанку (готівка):*\n"]
+#     for ccy, label in CURRENCY_LABELS.items():
+#         points = history.get(ccy, [])
+#         if not points:
+#             continue
+#         buy_today, sale_today = points[-1][1], points[-1][2]
+#         diff = sale_today - points[0][2]
+#         arrow = "📈" if diff > 0.005 else ("📉" if diff < -0.005 else "➡️")
+#         diff_str = f"+{diff:.2f}" if diff >= 0 else f"{diff:.2f}"
+#         lines.append(
+#             f"*{ccy}* — {label}\n"
+#             f"  купівля: `{buy_today:.2f}` / продаж: `{sale_today:.2f}`\n"
+#             f"  {arrow} за {period_label}: `{diff_str} грн`"
+#         )
+#     if len(lines) == 1:
+#         return "❌ Не вдалося отримати дані."
+#     return "\n\n".join(lines)
+#
+#
+# async def _send_rates(days: int) -> tuple[io.BytesIO, str]:
+#     history = await fetch_rates_history(days)
+#     return build_rates_chart(history, days), build_rates_text(history, days)
+#
+#
+# async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     status = await update.message.reply_text("⏳ Збираю дані...")
+#     chart, text = await _send_rates(7)
+#     await status.delete()
+#     await update.message.reply_photo(
+#         photo=chart, caption=text, parse_mode="Markdown", reply_markup=rates_keyboard(7)
+#     )
+#
+#
+# async def handle_rates_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     query = update.callback_query
+#     await query.answer()
+#     days = int(query.data.split(":")[1])
+#     await query.edit_message_caption(caption="⏳ Оновлюю...", parse_mode="Markdown")
+#     chart, text = await _send_rates(days)
+#     await query.edit_message_media(
+#         media=InputMediaPhoto(media=chart, caption=text, parse_mode="Markdown"),
+#         reply_markup=rates_keyboard(days),
+#     )
+#
+#
+# async def send_rates_job(context: ContextTypes.DEFAULT_TYPE):
+#     if not RATES_CHAT_ID:
+#         return
+#     chart, text = await _send_rates(7)
+#     await context.bot.send_photo(
+#         chat_id=RATES_CHAT_ID, photo=chart, caption=text,
+#         parse_mode="Markdown", reply_markup=rates_keyboard(7)
+#     )
 
 
-async def _fetch_p2p_prices(trade_type: str) -> list[float]:
-    payload = {
-        "fiat": "UAH",
-        "page": 1,
-        "rows": 5,
-        "tradeType": trade_type,
-        "asset": "USDT",
-        "countries": [],
-        "payTypes": [],
-        "publisherType": None,
-        "classifies": ["mass", "profession"],
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(BINANCE_P2P_URL, json=payload, headers=BINANCE_HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-    return [float(ad["adv"]["price"]) for ad in data.get("data", [])]
+# ── Binance P2P (вимкнено) ────────────────────────────────────────────────────
 
-
-async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text("⏳ Отримую курс USDT/UAH...")
-    try:
-        buy_prices, sell_prices = await asyncio.gather(
-            _fetch_p2p_prices("BUY"),
-            _fetch_p2p_prices("SELL"),
-        )
-        if not buy_prices or not sell_prices:
-            await status.edit_text("❌ Не вдалося отримати дані з Binance P2P.")
-            return
-        avg_buy = sum(buy_prices) / len(buy_prices)
-        avg_sell = sum(sell_prices) / len(sell_prices)
-        text = (
-            "🟡 *Binance P2P — USDT/UAH*\n\n"
-            f"Купити USDT: `{avg_buy:.2f} UAH`\n"
-            f"Продати USDT: `{avg_sell:.2f} UAH`\n\n"
-            f"_Середнє по топ-5 оголошеннях_"
-        )
-        await status.edit_text(text, parse_mode="Markdown")
-    except Exception as e:
-        log.warning("Binance P2P error: %s", e)
-        await status.edit_text("❌ Помилка при зверненні до Binance P2P.")
+# BINANCE_P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+# BINANCE_HEADERS = {
+#     "Content-Type": "application/json",
+#     "User-Agent": "Mozilla/5.0",
+# }
+#
+#
+# async def _fetch_p2p_prices(trade_type: str) -> list[float]:
+#     payload = {
+#         "fiat": "UAH",
+#         "page": 1,
+#         "rows": 5,
+#         "tradeType": trade_type,
+#         "asset": "USDT",
+#         "countries": [],
+#         "payTypes": [],
+#         "publisherType": None,
+#         "classifies": ["mass", "profession"],
+#     }
+#     async with httpx.AsyncClient(timeout=10) as client:
+#         resp = await client.post(BINANCE_P2P_URL, json=payload, headers=BINANCE_HEADERS)
+#         resp.raise_for_status()
+#         data = resp.json()
+#     return [float(ad["adv"]["price"]) for ad in data.get("data", [])]
+#
+#
+# async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     status = await update.message.reply_text("⏳ Отримую курс USDT/UAH...")
+#     try:
+#         buy_prices, sell_prices = await asyncio.gather(
+#             _fetch_p2p_prices("BUY"),
+#             _fetch_p2p_prices("SELL"),
+#         )
+#         if not buy_prices or not sell_prices:
+#             await status.edit_text("❌ Не вдалося отримати дані з Binance P2P.")
+#             return
+#         avg_buy = sum(buy_prices) / len(buy_prices)
+#         avg_sell = sum(sell_prices) / len(sell_prices)
+#         text = (
+#             "🟡 *Binance P2P — USDT/UAH*\n\n"
+#             f"Купити USDT: `{avg_buy:.2f} UAH`\n"
+#             f"Продати USDT: `{avg_sell:.2f} UAH`\n\n"
+#             f"_Середнє по топ-5 оголошеннях_"
+#         )
+#         await status.edit_text(text, parse_mode="Markdown")
+#     except Exception as e:
+#         log.warning("Binance P2P error: %s", e)
+#         await status.edit_text("❌ Помилка при зверненні до Binance P2P.")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -388,7 +374,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return  # тимчасово вимкнено
     msg = update.message
     if not msg:
         return
@@ -538,16 +523,10 @@ if __name__ == "__main__":
         log.info("Використовується локальний Bot API сервер: %s", LOCAL_BOT_API)
 
     app = builder.build()
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("rates", cmd_rates))
-    app.add_handler(CommandHandler("crypto", cmd_crypto))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^dl:"))
-    app.add_handler(CallbackQueryHandler(handle_rates_period, pattern=r"^rates_period:"))
-
-    if RATES_CHAT_ID:
-        app.job_queue.run_repeating(send_rates_job, interval=8 * 3600, first=10)
-        log.info("Авторозсилка курсів кожні 8 год у чат %s", RATES_CHAT_ID)
 
     log.info("Bot started (max file size: %d MB)", MAX_SIZE_MB)
     app.run_polling()
