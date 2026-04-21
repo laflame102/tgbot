@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -468,14 +468,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await status.edit_text("❌ Не вдалося завантажити файл.")
                         continue
                     await status.edit_text("📤 Відправляю...")
-                    for filepath in filepaths:
-                        size_mb = os.path.getsize(filepath) / 1024 / 1024
-                        if size_mb > MAX_SIZE_MB:
-                            await msg.reply_text(
-                                f"❌ Файл {size_mb:.1f} MB — перевищує ліміт {MAX_SIZE_MB} MB."
-                            )
-                            continue
-                        await _send_file(msg, filepath, audio_mode=False)
+                    valid = [p for p in filepaths if os.path.getsize(p) / 1024 / 1024 <= MAX_SIZE_MB]
+                    if not valid:
+                        await status.edit_text(f"❌ Файли перевищують ліміт {MAX_SIZE_MB} MB.")
+                        continue
+                    if len(valid) == 1:
+                        await _send_file(msg, valid[0], audio_mode=False)
+                    else:
+                        media = [InputMediaVideo(open(p, "rb")) for p in valid]
+                        await msg.reply_media_group(media=media)
                     await status.delete()
             except yt_dlp.utils.DownloadError as e:
                 log.warning("DownloadError for %s: %s", url, e)
