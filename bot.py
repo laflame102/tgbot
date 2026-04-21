@@ -51,6 +51,8 @@ def _init_cookies() -> None:
 SUPPORTED_DOMAINS = (
     "tiktok.com",
     "vm.tiktok.com",
+    "twitter.com",
+    "x.com",
 )
 
 YOUTUBE_MUSIC_DOMAINS = ("music.youtube.com",)
