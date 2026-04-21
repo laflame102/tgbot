@@ -377,9 +377,9 @@ def download_all_videos(url: str, out_dir: str) -> list[str]:
 async def _send_file(msg, filepath: str, audio_mode: bool):
     with open(filepath, "rb") as f:
         if audio_mode:
-            await msg.reply_audio(f)
+            await msg.reply_audio(f, write_timeout=120, read_timeout=120)
         else:
-            await msg.reply_video(f, supports_streaming=True)
+            await msg.reply_video(f, supports_streaming=True, write_timeout=120, read_timeout=120)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -429,8 +429,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except yt_dlp.utils.DownloadError as e:
                 log.warning("DownloadError for %s: %s", url, e)
                 await status.edit_text(f"❌ Помилка завантаження:\n{e}")
-            except Exception:
-                log.exception("Unexpected error for %s", url)
+            except Exception as e:
+                log.warning("Error for %s: %s: %s", url, type(e).__name__, e)
                 await status.edit_text("❌ Сталась несподівана помилка.")
 
         elif is_youtube_video(url):
@@ -475,14 +475,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if len(valid) == 1:
                         await _send_file(msg, valid[0], audio_mode=False)
                     else:
-                        media = [InputMediaVideo(open(p, "rb")) for p in valid]
-                        await msg.reply_media_group(media=media)
+                        handles = [open(p, "rb") for p in valid]
+                        try:
+                            media = [InputMediaVideo(f) for f in handles]
+                            await msg.reply_media_group(media=media, write_timeout=120, read_timeout=120)
+                        finally:
+                            for f in handles:
+                                f.close()
                     await status.delete()
             except yt_dlp.utils.DownloadError as e:
                 log.warning("DownloadError for %s: %s", url, e)
                 await status.edit_text(f"❌ Помилка завантаження:\n{e}")
-            except Exception:
-                log.exception("Unexpected error for %s", url)
+            except Exception as e:
+                log.warning("Error for %s: %s: %s", url, type(e).__name__, e)
                 await status.edit_text("❌ Сталась несподівана помилка.")
 
 
