@@ -299,21 +299,38 @@ async def fetch_twitter_media(url: str) -> dict | None:
     if not match:
         return None
     tweet_id = match.group(1)
-    api = f"https://api.fxtwitter.com/status/{tweet_id}"
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(api)
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-    except Exception as e:
-        log.warning("fxtwitter error for %s: %s", url, e)
-        return None
-    tweet = data.get("tweet") or {}
-    media = tweet.get("media") or {}
-    photos = [p.get("url") for p in (media.get("photos") or []) if p.get("url")]
-    videos = [v.get("url") for v in (media.get("videos") or []) if v.get("url")]
-    return {"photos": photos, "videos": videos}
+    endpoints = (
+        f"https://api.fxtwitter.com/status/{tweet_id}",
+        f"https://api.vxtwitter.com/status/{tweet_id}",
+    )
+    for api in endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                resp = await client.get(api)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+        except Exception as e:
+            log.warning("twitter api error %s: %s", api, e)
+            continue
+
+        # fxtwitter format
+        if "tweet" in data:
+            tweet = data.get("tweet") or {}
+            media = tweet.get("media") or {}
+            photos = [p.get("url") for p in (media.get("photos") or []) if p.get("url")]
+            videos = [v.get("url") for v in (media.get("videos") or []) if v.get("url")]
+        else:
+            # vxtwitter format
+            photos = [u for u in (data.get("mediaURLs") or []) if u and "video" not in u]
+            videos = [
+                m.get("url")
+                for m in (data.get("media_extended") or [])
+                if m.get("type") in ("video", "gif") and m.get("url")
+            ]
+        if photos or videos:
+            return {"photos": photos, "videos": videos}
+    return None
 
 
 def is_youtube_music(url: str) -> bool:
