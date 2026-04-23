@@ -10,7 +10,13 @@ from pathlib import Path
 import httpx
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -53,7 +59,11 @@ SUPPORTED_DOMAINS = (
     "vm.tiktok.com",
     "twitter.com",
     "x.com",
+    "instagram.com",
+    "instagr.am",
 )
+
+TWITTER_STATUS_RE = re.compile(r"(?:twitter\.com|x\.com)/[^/]+/status/(\d+)")
 
 YOUTUBE_MUSIC_DOMAINS = ("music.youtube.com",)
 YOUTUBE_VIDEO_DOMAINS = ("youtube.com", "youtu.be")
@@ -280,6 +290,32 @@ def is_supported(url: str) -> bool:
     return any(domain in url for domain in SUPPORTED_DOMAINS)
 
 
+def is_twitter(url: str) -> bool:
+    return "twitter.com" in url or "x.com" in url
+
+
+async def fetch_twitter_media(url: str) -> dict | None:
+    match = TWITTER_STATUS_RE.search(url)
+    if not match:
+        return None
+    tweet_id = match.group(1)
+    api = f"https://api.fxtwitter.com/status/{tweet_id}"
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.get(api)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+    except Exception as e:
+        log.warning("fxtwitter error for %s: %s", url, e)
+        return None
+    tweet = data.get("tweet") or {}
+    media = tweet.get("media") or {}
+    photos = [p.get("url") for p in (media.get("photos") or []) if p.get("url")]
+    videos = [v.get("url") for v in (media.get("videos") or []) if v.get("url")]
+    return {"photos": photos, "videos": videos}
+
+
 def is_youtube_music(url: str) -> bool:
     return any(domain in url for domain in YOUTUBE_MUSIC_DOMAINS)
 
@@ -457,7 +493,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         else:
-            # Інші платформи (TikTok, Twitter) — завантажуємо всі відео з поста
+            # Twitter з картинками — тягнемо галерею через fxtwitter
+            if is_twitter(url):
+                twitter_media = await fetch_twitter_media(url)
+                if twitter_media and twitter_media["photos"] and not twitter_media["videos"]:
+                    status = await msg.reply_text("⏳ Завантажую картинки...")
+                    try:
+                        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                            photos_bytes = []
+                            for photo_url in twitter_media["photos"]:
+                                r = await client.get(photo_url)
+                                r.raise_for_status()
+                                photos_bytes.append(r.content)
+                        await status.edit_text("📤 Відправляю...")
+                        if len(photos_bytes) == 1:
+                            await msg.reply_photo(
+                                photos_bytes[0], write_timeout=120, read_timeout=120
+                            )
+                        else:
+                            media = [InputMediaPhoto(d) for d in photos_bytes]
+                            await msg.reply_media_group(
+                                media=media, write_timeout=120, read_timeout=120
+                            )
+                        await status.delete()
+                    except Exception as e:
+                        log.warning("Twitter gallery error for %s: %s", url, e)
+                        await status.edit_text("❌ Не вдалося завантажити картинки.")
+                    continue
+
+            # Інші платформи (TikTok, Twitter-відео, Instagram) — завантажуємо всі відео
             status = await msg.reply_text("⏳ Завантажую...")
             try:
                 with tempfile.TemporaryDirectory() as tmp:
